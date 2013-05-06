@@ -91,7 +91,7 @@ VARIABLE_IDENTIFIER = "%"
 def pythonVersionOK():
     version = sys.version_info
     return (version[0] == 2 and
-            (version[1] in [4,5,6]))
+            (version[1] in [4,5,6,7]))
 
 # our own logging class; allows us to enable/disable it more easily
 class logit:
