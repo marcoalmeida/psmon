@@ -205,7 +205,7 @@ def sizeToKiB(size):
     # if no conversion is required, just end it here
     try:
         int(unit)
-        ret = size
+        return float(size)
     except ValueError:
         pass
     # normal conversion process
@@ -224,7 +224,7 @@ def sizeToKiB(size):
             ret = value*1024*1024
         elif unit == "t":
             ret = value*1024*1024*1024
-        return float(ret)
+    return float(ret)
 
 ###
 # script init
