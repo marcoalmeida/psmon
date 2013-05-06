@@ -1,0 +1,696 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2009-2013 Marco Almeida marcoafalmeida@gmail.com
+
+# This file is part of psmon.
+
+# psmon is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# psmon is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with psmon; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+
+
+"""psmon: Process monitoring utility with customizable email
+notification facilities."""
+
+
+import sys
+import os
+import logging
+import smtplib
+import time
+from optparse import OptionParser
+from subprocess import Popen, PIPE, STDOUT
+import socket
+
+
+__author__ = "Marco Almeida"
+__copyright__ = "Copyright 2009-1023, Marco Almeida"
+__license__ = "GPL"
+__version__ = "0.4"
+__maintainer__ = "Marco Almeida"
+__email__ = "marcoafalmeida@gmail.com"
+__status__ = "Production"
+
+
+SELF_FILENAME = os.path.basename(__file__)
+
+LOG_FILENAME = os.path.expanduser("~/.%s.log" % os.path.basename(__file__))
+LOG_LEVEL = {'debug': logging.DEBUG,
+             'info': logging.INFO,
+             'warning': logging.WARNING,
+             'error': logging.ERROR,
+             'critical': logging.CRITICAL}
+
+
+# posix ps output specifiers; args *has* to the the last element
+# because it contains whitespace
+PS_OUTPUT_SPECIFIERS = ["user", "ruser", "group", "rgroup", "pid", "ppid",
+                        "pgid", "pcpu", "vsz", "nice", "etime", "time",
+                        "tty", "comm", "args"]
+PS_FILTER_FUNCS = ["filterStrCmp", "filterStrCmp", "filterStrCmp",
+                   "filterStrCmp", "filterIntCmp", "filterIntCmp",
+                   "filterIntCmp", "filterIntCmp", "filterIntCmp",
+                   "filterIntCmp", "filterTimeCmp","filterTimeCmp",
+                   "filterStrCmp", "filterStrCmp", "filterStrCmp"]
+# (matched) process count is very usefull
+COUNT_SPECIFIER = "count"
+# valid filters list
+FILTER_LIST = [COUNT_SPECIFIER] + PS_OUTPUT_SPECIFIERS
+# ...and respective filter comparison functions
+FILTER_FUNCS = ["filterIntCmp"] + PS_FILTER_FUNCS
+
+# filter predicates stuff
+FILTER_PREDICATE = dict(zip(FILTER_LIST, FILTER_FUNCS))
+FILTER_OPS = ["<", ">", "==", "!="]
+FILTER_ITEM = 0
+FILTER_OP = 1
+FILTER_VALUE = 2
+
+# all the filters (ps output options) are valid output specifiers
+OUTPUT_LIST = FILTER_LIST
+# necessary because of the "count" filter
+UNCONDITIONAL_SEND_REPORT = False
+
+# char to identify the beginning of a variable in a formated string;
+# variable names are enclosed with {}. i'm using '%' instead of '$'
+# because: 1) it's more familiar with python string formats; 2) '$' is
+# already used by a lot of shells
+VARIABLE_IDENTIFIER = "%"
+
+# check for the correct python version
+def pythonVersionOK():
+    version = sys.version_info
+    return (version[0] == 2 and
+            (version[1] in [4,5,6]))
+
+# our own logging class; allows us to enable/disable it more easily
+class logit:
+    def __init__(self, filename, name_instance=None):
+        self.enabled = True
+        if name_instance is None:
+            name_instance = "root"
+        logging.basicConfig(filename=filename)
+        self.logger = logging.getLogger(name_instance)
+
+    def disable(self):
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+
+    def setlevel(self, level):
+        self.logger.setLevel(level)
+
+    def debug(self, string):
+        if self.enabled:
+            self.logger.debug(string)
+
+    def info(self, string):
+        if self.enabled:
+            self.logger.info(string)
+
+    def warning(self, string):
+        if self.enabled:
+            self.logger.warning(string)
+
+    def error(self, string):
+        if self.enabled:
+            self.logger.error(string)
+
+    def critical(self, string):
+        if self.enabled:
+            self.logger.critical(string)
+
+###
+# filter comparison functions; different data types need different
+# comparison methods
+###
+# string comparison (most common)
+def filterStrCmp(fltr, output):
+    return eval("'%s' %s '%s'" % (fltr[FILTER_VALUE], fltr[FILTER_OP], output))
+
+# integer comparison; also used for floating point values (such as
+# %CPU)
+def filterIntCmp(fltr, output):
+    value = sizeToKiB(fltr[FILTER_VALUE])
+    return eval("%d %s %d" % (int(output), fltr[FILTER_OP], value))
+
+# just convert `ps` output time format (days-hours:minutes:seconds) to
+# the equivalent number of seconds and call filterIntCmp()
+def filterTimeCmp(fltr, output):
+    seconds = timeStringToSeconds(output)
+    return filterIntCmp(fltr, seconds)
+
+###
+# try to find the MX record of a domain
+###
+def getMX(email_addr):
+    try:
+        domain = email_addr.split("@")[1]
+    except IndexError:
+        return None
+    try:
+        p = Popen(["host", "-t", "mx", domain], stdout=PIPE)
+    except OSError:
+        return None
+    else:
+        answer = p.communicate()[0]
+        if answer:
+            if not "handled" in answer:
+                return None
+            # we only consider the first mail server; there is no
+            # fallback to secondary MX records
+            mx = answer.split("\n")[0]
+            mx = mx.split()[-1]
+            # discard the . in the end
+            if mx[-1] == ".":
+                mx = mx[:-1]
+            return mx
+
+# convert a time string of the form [[dd-]hh:]mm:ss ('ps' standard) to
+# the equivalent value in seconds
+def timeStringToSeconds(string):
+    if string.find(":") == -1:
+        return None
+    s = [3600, 60, 1]
+    try:
+        (days, hours) = string.split("-")
+        days = int(days)
+    except ValueError:
+        days = 0
+        hours = string
+    time_parts = hours.split(":")
+    seconds = days * 86400
+    for i in xrange(-1, -(len(time_parts)+1), -1):
+        seconds += (int(time_parts[i]) * s[i])
+    return seconds
+
+# convert some size unit with the usual sufixes (b, k, m, g, t) to KiB,
+# in order to simplify the comparison with the output from `ps`
+# (memory size, for example)
+def sizeToKiB(size):
+    # this convertion is case insensitive
+    value = size[:-1]
+    unit = size[-1].lower()
+    # if no conversion is required, just end it here
+    try:
+        int(unit)
+        ret = size
+    except ValueError:
+        pass
+    # normal conversion process
+    try:
+        value = float(value)
+    except ValueError:
+        raise
+    else:
+        if unit == "b":
+            ret = value/1024
+        elif unit == "k":
+            ret = value
+        elif unit == "m":
+            ret = value*1024
+        elif unit == "g":
+            ret = value*1024*1024
+        elif unit == "t":
+            ret = value*1024*1024*1024
+        return float(ret)
+
+###
+# script init
+###
+# command line parsing
+def parseOptions():
+    parser = OptionParser()
+    # process selection
+    parser.add_option("-p", "--pid", dest="pid", metavar="PID", default=None,
+                      type="int", help="monitor process PID")
+    parser.add_option("-m", "--match", dest="match", metavar="CMDLINE", default=None,
+                      help="monitor all processes where CMDLINE matches the command line")
+    # invert result
+    parser.add_option("-R", "--reverse", dest="reverse", metavar="REVERSE", action="store_true",
+                      default=False, help="report only when there is no output (no matching processes or all matched processes were filtered)")
+    # process filtering
+    parser.add_option("-f", "--filter", dest="filter", metavar="FILTER", action="append",
+                      default=[], help="monitor processes which pass the filter (predicate list)")
+    # action to execute on the monitored processes
+    parser.add_option("-a", "--action", dest="action", metavar="ACTION",
+                      default=None, help="action to execute (shell command) on each of the monitored processes")
+    # report
+    parser.add_option("-r", "--report", dest="report", metavar="FILE", default=None,
+                      help="write report to FILE")
+    parser.add_option("", "--append", dest="append", action="store_true", default=False,
+                      help="append reports instead of overwriting FILE")
+    parser.add_option("-M", "--mail-to", dest="mail_to", metavar="ADDRESS", default=None,
+                      help="send report to ADDRESS")
+    # gathered output
+    parser.add_option("-o", "--output", dest="output", metavar="OUTPUT", action="append", default=[],
+                      help="information to include on the report (for each monitored process)")
+    # operation mode
+    parser.add_option("-s", "--sleep", dest="sleep", metavar="SLEEP", default=1,
+                      type="int", help="pause between monitorizations (in seconds)")
+    parser.add_option("-d", "--displays", dest="displays", metavar="COUNT", default=None,
+                      type="int", help="monitor COUNT times and quit")
+    parser.add_option("-Q", "--auto-quit", dest="auto_quit", action="store_true", default=False,
+                      help="stops monitoring as soon as the matching produces no output")
+    # description of the job
+    parser.add_option("-t", "--title", dest="title", metavar="TITLE",
+                      default=None, help="title of the report")
+    # daemonize
+    parser.add_option("-D", "--daemon", dest="daemon", metavar="DAEMON", action="store_true",
+                      default=False, help="run as a daemon")
+    # list currently running psmon instances
+    parser.add_option("-l", "--list", dest="list", metavar="LIST", action="store_true",
+                      default=False, help="list currently running %s instances" % SELF_FILENAME)
+    # log
+    parser.add_option("-L", "--log", dest="log", metavar="LEVEL", default=None,
+                      help="log level: %s,none; log file is %s" % (",".join(LOG_LEVEL), LOG_FILENAME))
+    # mail options
+    parser.add_option("", "--mail-server", dest="mail_server", metavar="SERVER", default=None,
+                      help="user SERVER as the SMTP server")
+    parser.add_option("", "--mail-port", dest="mail_port", metavar="PORT", default=25,
+                      type="int", help="connect to non-standard port PORT")
+    parser.add_option("", "--mail-from", dest="mail_from", metavar="FROM",
+                      default=("%s@%s" % ( SELF_FILENAME, socket.gethostname())), help="use FROM as source address")
+    parser.add_option("", "--mail-user", dest="mail_user", metavar="USER", default=None,
+                      help="authenticate at SERVER with the login USER")
+    parser.add_option("", "--mail-passwd", dest="mail_passwd", metavar="PASSWD", default=None,
+                      help="authenticate at SERVER with the password PASSWD")
+    parser.add_option("", "--mail-ssl", dest="mail_ssl", action="store_true",
+                      default=False, help="use SSL when connecting to the SMTP server")
+    # parsing and error checking
+    (options, args) = parser.parse_args()
+    checkOptions(parser, options)
+    return (options, args)
+
+def checkOptions(parser, options):
+    # sets up some nice defaults for the -l option (unless the user
+    # has already defined any of them)
+    if options.list is True:
+        if options.displays is None:
+            options.displays = 1
+        if options.output == []:
+            options.output = ["pid", "args"]
+    # filter checks
+    for f in options.filter:
+        (key, op, value) = compileFilter(f)
+        if key not in FILTER_LIST:
+            parser.error("FILTERed element must be one of: %s" % ",".join(FILTER_LIST))
+        if op not in FILTER_OPS:
+            parser.error("FILTER operator must be one of: %s" % ",".join(FILTER_OPS))
+    # options checks
+    for i in options.output:
+        if i not in OUTPUT_LIST:
+            parser.error("OUTPUT element must be one of: %s" % ",".join(OUTPUT_LIST))
+    # log level checks
+    if options.log and (options.log not in LOG_LEVEL):
+        parser.error("log LEVEL must be one of: %s" % ",".join(LOG_LEVEL))
+    # daemon does not print on stdout
+    if options.daemon and not (options.mail_to or options.report):
+        parser.error("when running as daemon the report can only be saved to a file or sent by email")
+    # if the report is to be sent by mail, at least the mail server
+    # must be supplied
+    if options.mail_to and not options.mail_server:
+        # try to get the MX record before reporting an error
+        mx = getMX(options.mail_to)
+        print mx
+        if mx:
+            options.mail_server = mx
+        else:
+            parser.error("MX detection failed: you must use --mail-server")
+
+
+# execute a sequence of shell command and return the output string
+def execCmdSeq(cmd_seq, logger):
+    logger.debug("sequence to run %s" % str(cmd_seq))
+    p = Popen(cmd_seq[0], stdout=PIPE, stderr=STDOUT)
+    for c in cmd_seq[1:]:
+        logger.debug("\trunning %s" % c)
+        p = Popen(c, stdin=p.stdout, stdout=PIPE)
+    return p.communicate()[0]
+
+# create a tuple (item,op,value) from the filter option string
+def compileFilter(string):
+    for op in FILTER_OPS:
+        i = string.find(op)
+        if i != -1:
+            break
+    # this will only be true if no operator was found on the filter
+    if i == -1:
+        return None
+    # get the key (filter field) and the value to filter with
+    try:
+        (key, value) = tuple([ x.strip() for x in string.split(op) ])
+    except ValueError:
+        return None
+    # does 'value' have the same format of a time string from 'ps'?
+    sec = timeStringToSeconds(value)
+    if sec is not None:
+        value = sec
+    return (key, op, value)
+
+# returns all available info (list of strings from the raw output of
+# `ps ...`) on processes which matched the pattern (or pid)
+def matchProcs(options, logger, only_self=False):
+    if options.pid:
+        logger.info("matching process %s" % options.pid)
+        cmd_seq = [["ps", "-p", "%s" % options.pid, "-o%s" %  ",".join(PS_OUTPUT_SPECIFIERS)]]
+    else:
+        cmd_seq = [["ps", "-A", "-o%s" %  ",".join(PS_OUTPUT_SPECIFIERS)]]
+        if options.match:
+            logger.info("matching processes with %s" % options.match)
+            cmd_seq.append(["grep", "%s" % options.match])
+        else:
+            logger.info("matching all processes")
+        if only_self:
+            # show only other running monitorizations processes
+            cmd_seq.append(["grep", "%s" % SELF_FILENAME])
+            # do not show this instance (-l is supposed to be the
+            # option for listing the monitorization instances)
+            cmd_seq.append(["grep", "-v", "\-l"])
+        else:
+            # usual match: exclude the monitorization processes
+            cmd_seq.append(["grep", "-v", "%s" % SELF_FILENAME])
+        # always exclude the references to 'grep'
+        cmd_seq.append(["grep", "-v", "grep"])
+    logger.debug("running command '%s'" % " | ".join([ " ".join(i) for i in cmd_seq ]))
+    result = execCmdSeq(cmd_seq, logger)
+    # discard empty strings
+    procs_info = [ i.strip() for i in result.split("\n") if i != "" ]
+    # discard the first line (header) when all processes are matched
+    # *and* not listing other monitorization processes because no
+    # 'grep' will remove it as side-effect
+    if not (options.pid or options.match or only_self):
+        del procs_info[0]
+    # when we match a specific pid, the first line of output is the
+    # `ps` header (there is no following `grep` to remove it)
+    if options.pid:
+        procs_info = procs_info[1:]
+    pids = [ i.split()[PS_OUTPUT_SPECIFIERS.index("pid")] for i in procs_info ]
+    logger.info("matched pids: %s" % ",".join(pids))
+    return procs_info
+
+# does this process pass the filter?
+def filterAccepted(string, proc_info, logger):
+    (key, op, mark) = compileFilter(string)
+    logger.info("\tusing predicate %s" % FILTER_PREDICATE[key])
+    apply_filter = eval(FILTER_PREDICATE[key])
+    if key == COUNT_SPECIFIER:
+        count = len(proc_info)
+        logger.info("\tfilter: %s; %s value: %s" % (string, key, count))
+        ret = apply_filter((key, op, mark), count)
+    # has to be one of PS_OUTPUT_SPECIFIERS; args checking already
+    # enforced it
+    else:
+        logger.info("\tfilter: %s; %s value: %s" % (string, key, proc_info[key]))
+        ret = apply_filter((key, op, mark), proc_info[key])
+    return ret
+
+# filter a list of processes according to the specified options;
+# procs_info is the dictionary of processes that matched some rule
+# (along with all the information about the process)
+def filterProcs(procs_info, options, logger):
+    global UNCONDITIONAL_SEND_REPORT
+    UNCONDITIONAL_SEND_REPORT = False
+    if not options.filter:
+        logger.debug("no filter rules to apply; skiping")
+        return procs_info
+    filtered = []
+    count_filter = None
+    for string in options.filter:
+        # the count filter is an exception and must only be
+        # applied when all the other filters have been checked
+        (key, op, mark) = compileFilter(string)
+        if key == COUNT_SPECIFIER:
+            count_filter = string
+            continue
+        for (pid, pinfo) in procs_info.items():
+            logger.info("filtering pid %s" % pid)
+            logger.info("\tchecking %s on pid %s" % (string, pid))
+            if filterAccepted(string, pinfo, logger):
+                logger.info("\tpassed the filter")
+            else:
+                logger.info("\tdid not pass the filter")
+                filtered.append(pid)
+    # remove filtered processes from the matched list
+    for i in filtered:
+        # the same process may be matched by more than 1 filter
+        if i in procs_info:
+            del procs_info[i]
+    # count filter
+    if count_filter is not None:
+        logger.info("starting count filtering")
+        logger.info("\tchecking filter %s" % COUNT_SPECIFIER)
+        # the count filter is sort of a global filter which superseeds
+        # everything else; if it passes, the report is sent, if it
+        # doesn't we consider all mathed processes to be filtered
+        if not filterAccepted(count_filter, procs_info, logger):
+            logger.info("\tdid not pass the filter")
+            return {}
+        else:
+            UNCONDITIONAL_SEND_REPORT = True
+            logger.info("\tpassed the filter")
+    else:
+        logger.info("no count filtering requested")
+    return procs_info
+
+
+# parse the string with each process info and return a dictionary of
+# the form dict[pid][field] = value, e.g., dict[980]["user"] = "marco"
+def extractProcsInfo(procs_info, logger):
+    pinfo = {}
+    for proc_info in procs_info:
+        logger.debug("will parse info from '%s'" % proc_info)
+        # whitespace is used as delimiter; 'args' is the only field
+        # with whitespace so we have to treat it differently (it's
+        # always the last element of PS_OUTPUT_SPECIFIERS
+        split_info = proc_info.split()
+        # all but 'args'
+        parsed_info = [ i.strip() for i in split_info[:len(PS_OUTPUT_SPECIFIERS)-1] if i != "" ]
+        # 'args' joined as one single field again
+        parsed_info.append(" ".join(split_info[len(PS_OUTPUT_SPECIFIERS)-1:]))
+        pid = parsed_info[PS_OUTPUT_SPECIFIERS.index("pid")]
+        logger.debug("parsed process with pid %s" % pid)
+        # a class to represent the matched pids info is probably an
+        # overkill; let's start with a dictionary of dictionaries:
+        # pinfo[pid][info] = value
+        logger.info("adding details for pid %s" % pid)
+        pinfo[pid] = dict(zip(PS_OUTPUT_SPECIFIERS, parsed_info))
+    return pinfo
+
+# get a list of tokens from the action string
+def tokenizeActionString(string, logger):
+    tokens = []
+    words = map(lambda x: x.strip(), string.split())
+    logger.debug("words to tokenize: %s" % words)
+    for w in words:
+        if w[0] == VARIABLE_IDENTIFIER:
+            var = w[2:-1]
+            if var not in PS_OUTPUT_SPECIFIERS:
+                logger.debug("\tnot a valid variable: %s" % w)
+                return None
+            else:
+                logger.debug("\tvalid variable: %s" % w)
+                tokens.append(var)
+        else:
+            logger.debug("\tuntouched token: %s" % w)
+            tokens.append(w)
+    return tokens
+
+# expand the action string according to the format
+def expandActionString(action, proc_info, logger):
+    cmd = []
+    tokens = tokenizeActionString(action, logger)
+    if tokens is None:
+        print "invalid variable in 'action'; allowed variables:", ",".join(PS_OUTPUT_SPECIFIERS)
+        return cmd
+    logger.debug("found tokens %s" % tokens)
+    for token in tokens:
+        if token in PS_OUTPUT_SPECIFIERS:
+            logger.debug("\ttoken %s replaced by %s" % (token, proc_info[token]))
+            cmd.append(proc_info[token])
+        else:
+            logger.debug("\tdirectly using token %s" % token)
+            cmd.append(token)
+    return cmd
+
+# execute the specified action
+def applyActionString(proc_info, options, logger):
+    output = ""
+    for pid in proc_info:
+        cmd = expandActionString(options.action, proc_info[pid], logger)
+        logger.info("executing command %s" % cmd)
+        output += "%s\n\t%s\n" % (" ".join(cmd), execCmdSeq([cmd], logger))
+    return output
+
+# creates the report with the requested info
+def generateReport(procs_info, action_result, options, logger):
+    # report title
+    if not options.title:
+        logger.debug("no title found; using argv")
+        options.title = " ".join(sys.argv)
+    report_title = "%s report: %s" % (SELF_FILENAME, options.title)
+    report = ""
+    if procs_info:
+        logger.info("generating report on %d matched processes" % len(procs_info))
+        # ps output fields
+        ps_output_fields = [ i for i in options.output if i in PS_OUTPUT_SPECIFIERS ]
+        if ps_output_fields:
+            # header
+            report += "%s\n" % "\t".join(ps_output_fields)
+            # the extra fields info is kept on this dictionary; here
+            # we must only iterate through the pids collected
+            for (pid, info) in procs_info.items():
+                report += "%s\n" %  "\t".join([ str(info[i]) for i in ps_output_fields ])
+        # the count specifier is diferent
+        if COUNT_SPECIFIER in options.output:
+            report += ("count: %d\n" % len(procs_info))
+        # result of executing the 'action' comand on each matched pid
+        if options.action is not None:
+            report += "\n%s" % action_result
+    else:
+        logger.info("generating report for no matched processes")
+        report += "no processes matched\n"
+        report += "the matching rules were:\n"
+        report += "pid:%s; pattern:%s; filters:%s\n" % (options.pid, options.match, ", ".join(options.filter))
+        # if the user asked to stop monitoring when no output is
+        # available, this is the place to do it
+        if options.auto_quit:
+            logger.info("signaling exit")
+            # easy way to signal exit
+            options.displays = 1
+    return (report_title, report)
+
+# send the report to the specified output channel
+def sendReport(title, report, options, logger):
+    if not options.report and not options.mail_to:
+        # send to stdout
+        logger.info("sending report to stdout")
+        print "%s\n\n%s" % (title, report)
+    elif options.mail_to:
+        # send email
+        logger.info("emailing report to %s" % options.mail_to)
+        mailReport(title, report, options, logger)
+    elif options.report:
+        # write to the file
+        logger.info("writing report to %s" % options.report)
+        if options.append:
+            logger.debug("\tappending to file")
+            fl = open(options.report, "a")
+        else:
+            logger.debug("\ttruncating file")
+            fl = open(options.report, "w")
+        fl.write(title)
+        fl.write("\n\n")
+        fl.write(report)
+        fl.close()
+
+# mail sender
+def mailReport(title, report, options, logger):
+    logger.debug("using SMTP server: %s" % options.mail_server)
+    server = smtplib.SMTP(options.mail_server, options.mail_port)
+    # server.set_debuglevel(9)
+    if options.mail_ssl:
+        server.starttls()
+    if options.mail_user and options.mail_passwd:
+        server.login(options.mail_user, options.mail_passwd)
+    msg = "Subject: %s\r\nFrom: %s\r\nTo: %s\r\n\r\n%s" % (title, options.mail_from,
+                                                           options.mail_to, report)
+    try:
+        server.sendmail(options.mail_from, options.mail_to, msg)
+    except smtplib.SMTPRecipientsRefused, e:
+        logger.critical("smtp error: %s" % e)
+    server.quit()
+
+# core of the script: find matching pids, filter pids, generate and
+# send the report
+def monitor(options, logger, only_self):
+    procs_matched = matchProcs(options, logger, only_self)
+    procs_info = extractProcsInfo(procs_matched, logger)
+    procs_filtered = filterProcs(procs_info, options, logger)
+    action_result = ""
+    if options.action is not None:
+        action_result = applyActionString(procs_filtered, options, logger)
+    (title, report) = generateReport(procs_filtered, action_result, options, logger)
+    if (UNCONDITIONAL_SEND_REPORT or
+        (procs_filtered and (not options.reverse)) or
+        ((not procs_filtered) and options.reverse)):
+        logger.info("send report unconditionally: %s" % UNCONDITIONAL_SEND_REPORT)
+        sendReport(title, report, options, logger)
+    else:
+        logger.info("not sending report because: procs_count=%s, reverse=%s" % (len(procs_filtered), options.reverse))
+
+# make it a daemon (R. Stevens, Advanced Programming in the Unix
+# Environment)
+def daemonize():
+    # already a daemon
+    if os.getppid() == 1:
+        return
+    # fork the parent process
+    pid = os.fork()
+    # error
+    if pid < 0:
+        sys.exit(1)
+    # the fork() was successful so we can exit the parent process
+    if pid > 0:
+        sys.exit(0)
+    # at this point we are executing as the child process
+    # change the file mode mask
+    os.umask(0)
+    # create a new SID for the child process
+    os.setsid()
+    # change the current working directory; this prevents the current
+    # directory from being locked, not being possible to remove it
+    os.chdir("/")
+    # redirect standard files to /dev/null
+    sys.stdin.close()
+    sys.stdin = open("/dev/null")
+    sys.stdout.close()
+    sys.stdout = open("/dev/null", "w")
+    sys.stderr.close()
+    sys.stderr = open("/dev/null", "w")
+
+def main():
+    # parse and check cmd line options
+    (options, args) = parseOptions()
+    # make it a daemon
+    if options.daemon:
+        daemonize()
+    # create logging instance (even when instantiated, the logger will
+    # not produce any output unless the user activates the option)
+    logger = logit(filename=LOG_FILENAME, name_instance=str(os.getpid()))
+    if options.log is None:
+        logger.disable()
+    else:
+        logger.setlevel(LOG_LEVEL[options.log])
+    logger.info("%s starting" % SELF_FILENAME)
+    # show monitorization processes?
+    show_monitor_procs = False
+    if options.list:
+        show_monitor_procs = True
+    while True:
+        monitor(options, logger, show_monitor_procs)
+        if options.displays:
+            options.displays -= 1
+        if options.displays == 0:
+            break
+        time.sleep(options.sleep)
+    return 0
+
+if __name__ == "__main__":
+    if not pythonVersionOK():
+        print "Wrong python version: ", sys.version_info
+        status = 1
+    else:
+        status = main()
+    sys.exit(status)
