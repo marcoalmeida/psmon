@@ -323,7 +323,6 @@ def checkOptions(parser, options):
     if options.mail_to and not options.mail_server:
         # try to get the MX record before reporting an error
         mx = getMX(options.mail_to)
-        print mx
         if mx:
             options.mail_server = mx
         else:
