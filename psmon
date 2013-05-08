@@ -274,7 +274,9 @@ def parseOptions():
                       default=False, help="list currently running %s instances" % SELF_FILENAME)
     # log
     parser.add_option("-L", "--log", dest="log", metavar="LEVEL", default=None,
-                      help="LEVEL is one of: %s; the log file is %s" % (", ".join(LOG_LEVEL), LOG_FILENAME))
+                      help="LEVEL is one of: %s" % ", ".join(LOG_LEVEL))
+    parser.add_option("", "--log-file", dest="log_filename", metavar="LOGFILE", default=LOG_FILENAME,
+                      help="path to the log file; defaults to %s" % LOG_FILENAME)
     # mail options
     parser.add_option("", "--mail-server", dest="mail_server", metavar="SERVER", default=None,
                       help="user SERVER as the SMTP server")
@@ -673,7 +675,7 @@ def main(options):
         daemonize()
     # create logging instance (even when instantiated, the logger will
     # not produce any output unless the user activates the option)
-    logger = logit(filename=LOG_FILENAME, name_instance=str(os.getpid()))
+    logger = logit(filename=options.log_filename, name_instance=str(os.getpid()))
     if options.log is None:
         logger.disable()
     else:
