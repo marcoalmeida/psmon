@@ -299,8 +299,6 @@ def checkOptions(parser, options):
     if options.list is True:
         if options.displays is None:
             options.displays = 1
-        if options.output == []:
-            options.output = ["pid", "args"]
     # filter checks
     for f in options.filter:
         (key, op, value) = compileFilter(f)
@@ -312,6 +310,9 @@ def checkOptions(parser, options):
     for i in options.output:
         if i not in OUTPUT_LIST:
             parser.error("OUTPUT element must be one of: %s" % ",".join(OUTPUT_LIST))
+    # default options: pid and args
+    if options.output == []:
+        options.output = ["pid", "args"]
     # log level checks
     if options.log and (options.log not in LOG_LEVEL):
         parser.error("log LEVEL must be one of: %s" % ",".join(LOG_LEVEL))
