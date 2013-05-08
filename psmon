@@ -274,7 +274,7 @@ def parseOptions():
                       default=False, help="list currently running %s instances" % SELF_FILENAME)
     # log
     parser.add_option("-L", "--log", dest="log", metavar="LEVEL", default=None,
-                      help="log level: %s,none; log file is %s" % (",".join(LOG_LEVEL), LOG_FILENAME))
+                      help="LEVEL is one of: %s; the log file is %s" % (", ".join(LOG_LEVEL), LOG_FILENAME))
     # mail options
     parser.add_option("", "--mail-server", dest="mail_server", metavar="SERVER", default=None,
                       help="user SERVER as the SMTP server")
@@ -288,8 +288,15 @@ def parseOptions():
                       help="authenticate at SERVER with the password PASSWD")
     parser.add_option("", "--mail-ssl", dest="mail_ssl", action="store_true",
                       default=False, help="use SSL when connecting to the SMTP server")
-    # parsing and error checking
+    # options parsing and error checking
+    # print
     (options, args) = parser.parse_args()
+    # the script was called with no options or with some positional
+    # argument (which we don't use); treat as an error
+    if len(sys.argv) == 1 or len(args) > 0:
+        parser.print_help()
+        return (None, None)
+    # no major issues so far, let's check the command line options
     checkOptions(parser, options)
     return (options, args)
 
@@ -303,19 +310,19 @@ def checkOptions(parser, options):
     for f in options.filter:
         (key, op, value) = compileFilter(f)
         if key not in FILTER_LIST:
-            parser.error("FILTERed element must be one of: %s" % ",".join(FILTER_LIST))
+            parser.error("FILTERed element must be one of: %s" % ", ".join(FILTER_LIST))
         if op not in FILTER_OPS:
-            parser.error("FILTER operator must be one of: %s" % ",".join(FILTER_OPS))
+            parser.error("FILTER operator must be one of: %s" % ", ".join(FILTER_OPS))
     # options checks
     for i in options.output:
         if i not in OUTPUT_LIST:
-            parser.error("OUTPUT element must be one of: %s" % ",".join(OUTPUT_LIST))
+            parser.error("OUTPUT element must be one of: %s" % ", ".join(OUTPUT_LIST))
     # default options: pid and args
     if options.output == []:
         options.output = ["pid", "args"]
     # log level checks
     if options.log and (options.log not in LOG_LEVEL):
-        parser.error("log LEVEL must be one of: %s" % ",".join(LOG_LEVEL))
+        parser.error("log LEVEL must be one of: %s" % ", ".join(LOG_LEVEL))
     # daemon does not print on stdout
     if options.daemon and not (options.mail_to or options.report):
         parser.error("when running as daemon the report can only be saved to a file or sent by email")
@@ -512,7 +519,7 @@ def expandActionString(action, proc_info, logger):
     cmd = []
     tokens = tokenizeActionString(action, logger)
     if tokens is None:
-        print "invalid variable in 'action'; allowed variables:", ",".join(PS_OUTPUT_SPECIFIERS)
+        print "invalid variable in 'action'; allowed variables:", ", ".join(PS_OUTPUT_SPECIFIERS)
         return cmd
     logger.debug("found tokens %s" % tokens)
     for token in tokens:
@@ -660,9 +667,7 @@ def daemonize():
     sys.stderr.close()
     sys.stderr = open("/dev/null", "w")
 
-def main():
-    # parse and check cmd line options
-    (options, args) = parseOptions()
+def main(options):
     # make it a daemon
     if options.daemon:
         daemonize()
@@ -688,9 +693,15 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    if not pythonVersionOK():
+    # parse and check cmd line options
+    (options, args) = parseOptions()
+    # something really bad happened, just exit (the options parser
+    # already printed the error description
+    if options is None:
+        status = 1
+    elif not pythonVersionOK():
         print "Wrong python version: ", sys.version_info
         status = 1
     else:
-        status = main()
+        status = main(options)
     sys.exit(status)
