@@ -44,7 +44,7 @@ __status__ = "Production"
 
 SELF_FILENAME = os.path.basename(__file__)
 
-LOG_FILENAME = os.path.expanduser("~/.%s.log" % os.path.basename(__file__))
+DEFAULT_LOG_FILENAME = os.path.expanduser("~/.%s.log" % os.path.basename(__file__))
 LOG_LEVEL = {'debug': logging.DEBUG,
              'info': logging.INFO,
              'warning': logging.WARNING,
@@ -275,8 +275,8 @@ def parseOptions():
     # log
     parser.add_option("-L", "--log", dest="log", metavar="LEVEL", default=None,
                       help="LEVEL is one of: %s" % ", ".join(LOG_LEVEL))
-    parser.add_option("", "--log-file", dest="log_filename", metavar="LOGFILE", default=LOG_FILENAME,
-                      help="path to the log file; defaults to %s" % LOG_FILENAME)
+    parser.add_option("", "--log-file", dest="log_filename", metavar="LOGFILE", default=DEFAULT_LOG_FILENAME,
+                      help="path to the log file; defaults to %s" % DEFAULT_LOG_FILENAME)
     # mail options
     parser.add_option("", "--mail-server", dest="mail_server", metavar="SERVER", default=None,
                       help="user SERVER as the SMTP server")
