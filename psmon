@@ -262,7 +262,7 @@ def parseOptions():
     parser.add_option("-d", "--displays", dest="displays", metavar="COUNT", default=None,
                       type="int", help="monitor COUNT times and quit")
     parser.add_option("-Q", "--auto-quit", dest="auto_quit", action="store_true", default=False,
-                      help="stops monitoring as soon as the matching produces no output")
+                      help="stops monitoring after sending the first report")
     # description of the job
     parser.add_option("-t", "--title", dest="title", metavar="TITLE",
                       default=None, help="title of the report")
@@ -572,16 +572,16 @@ def generateReport(procs_info, action_result, options, logger):
         report += "no processes matched\n"
         report += "the matching rules were:\n"
         report += "pid:%s; pattern:%s; filters:%s\n" % (options.pid, options.match, ", ".join(options.filter))
-        # if the user asked to stop monitoring when no output is
-        # available, this is the place to do it
-        if options.auto_quit:
-            logger.info("signaling exit")
-            # easy way to signal exit
-            options.displays = 1
     return (report_title, report)
 
 # send the report to the specified output channel
 def sendReport(title, report, options, logger):
+    # if the user asked to stop monitoring when the first report
+    # is sent, this is the place to do it
+    if options.auto_quit:
+        logger.info("signaling exit")
+        # easy way to signal exit
+        options.displays = 1
     if not options.report and not options.mail_to:
         # send to stdout
         logger.info("sending report to stdout")
